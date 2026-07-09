@@ -2,6 +2,22 @@
 
 Dependency-free Rust port of the [DOOM-fire-zig](https://github.com/const-void/DOOM-fire-zig) terminal stress test.
 
+## Install
+
+Install the latest published release from [crates.io](https://crates.io/crates/doom-fire-rs):
+
+```sh
+cargo install doom-fire-rs
+```
+
+Then run:
+
+```sh
+doom-fire-rs
+```
+
+## Run From Source
+
 ```sh
 cargo run --release
 ```
