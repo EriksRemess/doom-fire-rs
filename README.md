@@ -1,6 +1,6 @@
-# DOOM Fire RS
+# DOOM Fire in Rust
 
-Dependency-free Rust port of the parent `DOOM-fire-zig` terminal stress test.
+Dependency-free Rust port of the [DOOM-fire-zig](https://github.com/const-void/DOOM-fire-zig) terminal stress test.
 
 ```sh
 cargo run --release
@@ -12,4 +12,3 @@ alternate screen, shows a terminal capability preview, then renders the Doom
 fire animation until the process is stopped.
 
 License: GPL-3.0-or-later, matching the original project.
-# doom-fire-rs
