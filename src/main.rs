@@ -2,7 +2,12 @@ use std::{
     env, fmt,
     fs::File,
     io::{self, Read, Write},
-    process, thread,
+    process,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +33,8 @@ const COLOR_DEF: &str = "\x1B[48;5;0m\x1B[38;5;15m";
 const COLOR_ITALIC: &str = "\x1B[3m";
 const COLOR_NOT_ITALIC: &str = "\x1B[23m";
 const PX: &str = "\u{2580}";
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 const FIRE_PALETTE: [usize; 26] = [
     0, 233, 234, 52, 53, 88, 89, 94, 95, 96, 130, 131, 132, 133, 172, 214, 215, 220, 220, 221, 3,
@@ -79,12 +86,25 @@ impl App {
 
     fn run(&mut self) -> AppResult<()> {
         self.check_term_size()?;
+        if interrupted() {
+            return Ok(());
+        }
+
         self.show_term_capabilities()?;
+        if interrupted() {
+            return Ok(());
+        }
+
         self.show_doom_fire()
     }
 
     fn complete(&mut self) -> io::Result<()> {
         self.emit(&term_off())?;
+
+        if interrupted() {
+            return self.stdout.flush();
+        }
+
         self.emit("Complete!")?;
         self.emit(nl())?;
         self.stdout.flush()
@@ -124,11 +144,30 @@ impl App {
         self.emit("Press return to continue...")?;
         self.stdout.flush()?;
 
-        let mut byte = [0_u8; 1];
-        let bytes_read = io::stdin().read(&mut byte).unwrap_or(0);
-        if bytes_read == 1 && byte[0] == b'q' {
-            self.complete()?;
-            process::exit(0);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            let result =
+                io::stdin().read(&mut byte).map(
+                    |bytes_read| {
+                        if bytes_read == 1 { Some(byte[0]) } else { None }
+                    },
+                );
+            let _ = sender.send(result);
+        });
+
+        while !interrupted() {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(Ok(Some(b'q'))) => {
+                    self.complete()?;
+                    process::exit(0);
+                }
+                Ok(Ok(_)) => break,
+                Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted && interrupted() => break,
+                Ok(Err(err)) => return Err(err.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
 
         Ok(())
@@ -331,6 +370,10 @@ impl App {
 
         for txt_idx in 0..(text.len() / 2) {
             for fade in fade_seq {
+                if interrupted() {
+                    return Ok(());
+                }
+
                 self.emit(CURSOR_LOAD)?;
                 self.emit_bg(bg_idx)?;
                 self.emit(nl())?;
@@ -343,12 +386,16 @@ impl App {
                 self.emit(LINE_CLEAR_TO_EOL)?;
                 self.emit(nl())?;
 
-                thread::sleep(Duration::from_millis(10));
+                interruptible_sleep(Duration::from_millis(10));
             }
 
-            thread::sleep(Duration::from_millis(1_000));
+            interruptible_sleep(Duration::from_millis(1_000));
 
             for fade in fade_seq[1..].iter().rev().copied() {
+                if interrupted() {
+                    return Ok(());
+                }
+
                 self.emit(CURSOR_LOAD)?;
                 self.emit_bg(bg_idx)?;
                 self.emit(nl())?;
@@ -361,7 +408,7 @@ impl App {
                 self.emit(LINE_CLEAR_TO_EOL)?;
                 self.emit(nl())?;
 
-                thread::sleep(Duration::from_millis(10));
+                interruptible_sleep(Duration::from_millis(10));
             }
 
             self.emit(nl())?;
@@ -376,7 +423,7 @@ impl App {
         self.show_216_colors()?;
         self.show_grayscale()?;
         self.scroll_marquee()?;
-        self.pause()
+        if interrupted() { Ok(()) } else { self.pause() }
     }
 
     fn show_doom_fire(&mut self) -> AppResult<()> {
@@ -405,7 +452,7 @@ impl App {
         let init_frame = format!("{CURSOR_HOME}{}{}", self.bg[0], self.fg[0]);
         let mut frame = FrameBuffer::new(self.term_sz, &self.fg, &self.bg);
 
-        loop {
+        while !interrupted() {
             for x in 0..fire_w {
                 for y in 0..fire_h {
                     let fire_idx = y * fire_w + x;
@@ -465,6 +512,8 @@ impl App {
             frame.paint(self)?;
             frame.reset();
         }
+
+        Ok(())
     }
 }
 
@@ -580,6 +629,9 @@ fn main() {
 }
 
 fn run() -> AppResult<()> {
+    INTERRUPTED.store(false, Ordering::Relaxed);
+    platform::install_ctrl_c_handler()?;
+
     let mut app = App::new()?;
     let result = app.run();
     let cleanup = app.complete();
@@ -587,6 +639,23 @@ fn run() -> AppResult<()> {
     result?;
     cleanup?;
     Ok(())
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
+fn interruptible_sleep(duration: Duration) {
+    let deadline = Instant::now() + duration;
+
+    while !interrupted() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
 }
 
 fn init_colors(kind: &str) -> Vec<String> {
@@ -608,7 +677,7 @@ fn term_on() -> String {
 }
 
 fn term_off() -> String {
-    format!("{SCREEN_BUF_OFF}{CURSOR_SHOW}{}", nl())
+    format!("{COLOR_RESET}{CURSOR_SHOW}{SCREEN_BUF_OFF}")
 }
 
 fn format_binary_bytes(bytes: u64) -> String {
@@ -654,7 +723,7 @@ fn env_term_size() -> Option<TermSize> {
 
 #[cfg(unix)]
 mod platform {
-    use super::{TermSize, env_term_size};
+    use super::{INTERRUPTED, Ordering, TermSize, env_term_size};
     use std::{
         fs::File,
         io,
@@ -702,6 +771,22 @@ mod platform {
 
     unsafe extern "C" {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+        fn signal(signal: c_int, handler: usize) -> usize;
+    }
+
+    const SIGINT: c_int = 2;
+    const SIG_ERR: usize = usize::MAX;
+
+    extern "C" fn handle_sigint(_: c_int) {
+        INTERRUPTED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn install_ctrl_c_handler() -> io::Result<()> {
+        if unsafe { signal(SIGINT, handle_sigint as *const () as usize) } == SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
     }
 
     pub fn init_console() -> io::Result<Console> {
@@ -749,7 +834,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::TermSize;
+    use super::{INTERRUPTED, Ordering, TermSize};
     use std::{cmp, ffi::c_void, io, ptr};
 
     type Bool = i32;
@@ -767,6 +852,7 @@ mod platform {
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
     const DISABLE_NEWLINE_AUTO_RETURN: Dword = 0x0008;
     const CP_UTF8: Uint = 65001;
+    const CTRL_C_EVENT: Dword = 0;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -811,6 +897,27 @@ mod platform {
             lpNumberOfCharsWritten: *mut Dword,
             lpReserved: *mut c_void,
         ) -> Bool;
+        fn SetConsoleCtrlHandler(
+            HandlerRoutine: Option<unsafe extern "system" fn(Dword) -> Bool>,
+            Add: Bool,
+        ) -> Bool;
+    }
+
+    unsafe extern "system" fn handle_ctrl_c(ctrl_type: Dword) -> Bool {
+        if ctrl_type != CTRL_C_EVENT {
+            return 0;
+        }
+
+        INTERRUPTED.store(true, Ordering::Relaxed);
+        1
+    }
+
+    pub fn install_ctrl_c_handler() -> io::Result<()> {
+        if unsafe { SetConsoleCtrlHandler(Some(handle_ctrl_c), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
     }
 
     pub fn init_console() -> io::Result<Console> {
