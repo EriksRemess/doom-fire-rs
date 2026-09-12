@@ -7,3 +7,6 @@ description = "Dependency-free Rust port of DOOM-fire-zig"
 repository = "https://github.com/EriksRemess/doom-fire-rs"
 
 [dependencies]
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

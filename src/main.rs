@@ -1,7 +1,6 @@
 use std::{
-    env, fmt,
-    fs::File,
-    io::{self, Read, Write},
+    fmt,
+    io::{self, BufRead, IsTerminal, Write},
     process,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,6 +12,8 @@ use std::{
 
 const MAX_COLOR: usize = 256;
 const LAST_COLOR: usize = MAX_COLOR - 1;
+// Bound both the simulation and the worst-case encoded frame to a few dozen MiB.
+const MAX_TERM_CELLS: usize = 1_000_000;
 
 const CSI: &str = "\x1B[";
 const LINE_CLEAR_TO_EOL: &str = "\x1B[0K";
@@ -27,8 +28,6 @@ const SCREEN_BUF_ON: &str = "\x1B[?1049h";
 const SCREEN_BUF_OFF: &str = "\x1B[?1049l";
 const CHAR_SET_ASCII: &str = "\x1B(B";
 const COLOR_RESET: &str = "\x1B[0m";
-const COLOR_FG_DEF: &str = "\x1B[38;5;15m";
-const COLOR_BG_DEF: &str = "\x1B[48;5;0m";
 const COLOR_DEF: &str = "\x1B[48;5;0m\x1B[38;5;15m";
 const COLOR_ITALIC: &str = "\x1B[3m";
 const COLOR_NOT_ITALIC: &str = "\x1B[23m";
@@ -43,20 +42,48 @@ const FIRE_PALETTE: [usize; 26] = [
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TermSize {
     height: usize,
     width: usize,
 }
 
+impl TermSize {
+    fn validate(self) -> io::Result<Self> {
+        if self.width == 0 || self.height < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal must be at least 1 column by 2 rows",
+            ));
+        }
+        if self
+            .width
+            .checked_mul(self.height)
+            .is_none_or(|cells| cells > MAX_TERM_CELLS)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal exceeds the limit of 1,000,000 cells",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PauseScreen {
+    SizeWarning,
+    Capabilities,
+}
+
 struct App {
     stdout: io::Stdout,
-    #[cfg_attr(unix, allow(dead_code))]
     console: platform::Console,
     term_sz: TermSize,
     fg: Vec<String>,
     bg: Vec<String>,
     rng: Rng,
+    terminal_active: bool,
 }
 
 impl App {
@@ -64,7 +91,7 @@ impl App {
         let fg = init_colors("38;5;");
         let bg = init_colors("48;5;");
         let console = platform::init_console()?;
-        let term_sz = platform::term_size(&console)?;
+        let term_sz = platform::term_size(&console)?.validate()?;
         let rng = Rng::seeded();
 
         let mut app = Self {
@@ -74,6 +101,7 @@ impl App {
             fg,
             bg,
             rng,
+            terminal_active: true,
         };
 
         app.emit(&term_on())?;
@@ -90,6 +118,7 @@ impl App {
             return Ok(());
         }
 
+        self.term_sz = platform::term_size(&self.console)?.validate()?;
         self.show_term_capabilities()?;
         if interrupted() {
             return Ok(());
@@ -99,15 +128,14 @@ impl App {
     }
 
     fn complete(&mut self) -> io::Result<()> {
-        self.emit(&term_off())?;
-
-        if interrupted() {
-            return self.stdout.flush();
+        if self.terminal_active {
+            #[cfg(unix)]
+            platform::resume_output();
+            self.emit(&term_off())?;
+            self.stdout.flush()?;
+            self.terminal_active = false;
         }
-
-        self.emit("Complete!")?;
-        self.emit(nl())?;
-        self.stdout.flush()
+        Ok(())
     }
 
     fn emit(&mut self, s: &str) -> io::Result<()> {
@@ -131,36 +159,38 @@ impl App {
     fn emit_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         #[cfg(windows)]
         {
-            if platform::write_console(&self.console, bytes).is_ok() {
-                return Ok(());
-            }
+            platform::write_console(&self.console, bytes)
         }
 
+        #[cfg(not(windows))]
         self.stdout.write_all(bytes)
     }
 
-    fn pause(&mut self) -> AppResult<()> {
+    fn pause(&mut self, screen: PauseScreen) -> AppResult<()> {
         self.emit(COLOR_RESET)?;
         self.emit("Press return to continue...")?;
         self.stdout.flush()?;
 
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let mut byte = [0_u8; 1];
-            let result =
-                io::stdin().read(&mut byte).map(
-                    |bytes_read| {
-                        if bytes_read == 1 { Some(byte[0]) } else { None }
-                    },
-                );
+            let result = read_prompt(&mut io::stdin().lock());
             let _ = sender.send(result);
         });
 
         while !interrupted() {
+            if self.handle_suspend()?.is_some() && !interrupted() {
+                match screen {
+                    PauseScreen::SizeWarning => self.show_size_warning()?,
+                    PauseScreen::Capabilities => self.show_capability_colors()?,
+                }
+                self.emit(COLOR_RESET)?;
+                self.emit("Press return to continue...")?;
+                self.stdout.flush()?;
+            }
             match receiver.recv_timeout(Duration::from_millis(25)) {
-                Ok(Ok(Some(b'q'))) => {
-                    self.complete()?;
-                    process::exit(0);
+                Ok(Ok(true)) => {
+                    INTERRUPTED.store(true, Ordering::Relaxed);
+                    break;
                 }
                 Ok(Ok(_)) => break,
                 Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted && interrupted() => break,
@@ -185,6 +215,26 @@ impl App {
             return Ok(());
         }
 
+        self.show_size_warning()?;
+        self.pause(PauseScreen::SizeWarning)?;
+        if !interrupted() {
+            self.emit(COLOR_RESET)?;
+            self.emit(CURSOR_HOME)?;
+            self.emit(SCREEN_CLEAR)?;
+        }
+        Ok(())
+    }
+
+    fn show_size_warning(&mut self) -> AppResult<()> {
+        let min_w = 120;
+        let min_h = 22;
+        let width = self.term_sz.width;
+        let height = self.term_sz.height;
+        let w_ok = width >= min_w;
+        let h_ok = height >= min_h;
+        if w_ok && h_ok {
+            return self.show_term_size();
+        }
         self.emit_fg(9)?;
 
         if w_ok && !h_ok {
@@ -197,28 +247,6 @@ impl App {
                 "Screen may be too narrow - width is {} and need {}.",
                 width, min_w
             ))?;
-        } else if width == 0 {
-            self.emit_bg(1)?;
-            self.emit_fg(15)?;
-            self.emit_fmt(format_args!(
-                "Call to retreive terminal dimensions may have failed{}Width is {} (ZERO!) and we need {}.{}We will allocate 0 bytes of screen buffer, resulting in immediate failure.",
-                nl(),
-                width,
-                min_w,
-                nl()
-            ))?;
-            self.emit(COLOR_RESET)?;
-        } else if height == 0 {
-            self.emit_bg(1)?;
-            self.emit_fg(15)?;
-            self.emit_fmt(format_args!(
-                "Call to retreive terminal dimensions may have failed{}Height is {} (ZERO!) and we need {}.{}We will allocate 0 bytes of screen buffer, resulting in immediate failure.",
-                nl(),
-                height,
-                min_h,
-                nl()
-            ))?;
-            self.emit(COLOR_RESET)?;
         } else {
             self.emit_fmt(format_args!(
                 "Screen is too small - have {} x {} and need {} x {}",
@@ -238,12 +266,6 @@ impl App {
         self.emit("Continue?")?;
         self.emit(nl())?;
         self.emit(nl())?;
-
-        self.pause()?;
-
-        self.emit(COLOR_RESET)?;
-        self.emit(CURSOR_HOME)?;
-        self.emit(SCREEN_CLEAR)?;
 
         Ok(())
     }
@@ -340,19 +362,38 @@ impl App {
         Ok(())
     }
 
+    fn prepare_marquee(&mut self) -> AppResult<()> {
+        self.emit(CURSOR_SAVE)?;
+        self.emit_bg(222)?;
+        for _ in 0..4 {
+            self.emit(LINE_CLEAR_TO_EOL)?;
+            self.emit(nl())?;
+        }
+        Ok(())
+    }
+
+    fn marquee_sleep(&mut self, duration: Duration) -> AppResult<()> {
+        let deadline = Instant::now() + duration;
+        while !interrupted() {
+            if self.handle_suspend()?.is_some() {
+                if !interrupted() {
+                    self.show_capability_colors()?;
+                    self.prepare_marquee()?;
+                }
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
+        Ok(())
+    }
+
     fn scroll_marquee(&mut self) -> AppResult<()> {
         let bg_idx = 222;
-        let marquee_row = if cfg!(windows) {
-            nl().to_string()
-        } else {
-            format!("{LINE_CLEAR_TO_EOL}{}", nl())
-        };
-        let marquee_bg = marquee_row.repeat(4);
-
-        self.emit(CURSOR_SAVE)?;
-        self.emit_bg(bg_idx)?;
-        self.emit(&marquee_bg)?;
-
+        self.prepare_marquee()?;
         let text = [
             format!(
                 "  Things move along so rapidly nowadays that people saying {COLOR_ITALIC}It can't be done{COLOR_NOT_ITALIC} are always being interrupted"
@@ -386,10 +427,10 @@ impl App {
                 self.emit(LINE_CLEAR_TO_EOL)?;
                 self.emit(nl())?;
 
-                interruptible_sleep(Duration::from_millis(10));
+                self.marquee_sleep(Duration::from_millis(10))?;
             }
 
-            interruptible_sleep(Duration::from_millis(1_000));
+            self.marquee_sleep(Duration::from_millis(1_000))?;
 
             for fade in fade_seq[1..].iter().rev().copied() {
                 if interrupted() {
@@ -408,7 +449,7 @@ impl App {
                 self.emit(LINE_CLEAR_TO_EOL)?;
                 self.emit(nl())?;
 
-                interruptible_sleep(Duration::from_millis(10));
+                self.marquee_sleep(Duration::from_millis(10))?;
             }
 
             self.emit(nl())?;
@@ -417,180 +458,226 @@ impl App {
         Ok(())
     }
 
-    fn show_term_capabilities(&mut self) -> AppResult<()> {
+    fn show_capability_colors(&mut self) -> AppResult<()> {
         self.show_term_size()?;
         self.show_standard_colors()?;
         self.show_216_colors()?;
-        self.show_grayscale()?;
+        self.show_grayscale()
+    }
+
+    fn show_term_capabilities(&mut self) -> AppResult<()> {
+        self.show_capability_colors()?;
         self.scroll_marquee()?;
-        if interrupted() { Ok(()) } else { self.pause() }
+        if interrupted() {
+            Ok(())
+        } else {
+            self.pause(PauseScreen::Capabilities)
+        }
+    }
+
+    fn handle_suspend(&mut self) -> AppResult<Option<Duration>> {
+        #[cfg(unix)]
+        if !interrupted() && platform::take_suspend_request() {
+            let start = Instant::now();
+            self.complete()?;
+            platform::suspend_process()?;
+            if !interrupted() {
+                self.term_sz = platform::term_size(&self.console)?.validate()?;
+                self.terminal_active = true;
+                self.emit(&term_on())?;
+                self.stdout.flush()?;
+            }
+            return Ok(Some(start.elapsed()));
+        }
+        Ok(None)
     }
 
     fn show_doom_fire(&mut self) -> AppResult<()> {
-        let fire_h = self.term_sz.height * 2;
-        let fire_w = self.term_sz.width;
-        if fire_h == 0 || fire_w == 0 {
-            return Err("terminal size is zero; cannot render fire".into());
-        }
-
-        let fire_sz = fire_h * fire_w;
-        let fire_last_row = (fire_h - 1) * fire_w;
-        let fire_black = 0_u8;
-        let fire_white = (FIRE_PALETTE.len() - 1) as u8;
-
-        let mut screen_buf = vec![fire_black; fire_sz];
-        for x in 0..fire_w {
-            screen_buf[fire_last_row + x] = fire_white;
-        }
-
-        self.emit(CURSOR_HOME)?;
-        self.emit(COLOR_RESET)?;
-        self.emit(COLOR_BG_DEF)?;
-        self.emit(COLOR_FG_DEF)?;
+        self.term_sz = platform::term_size(&self.console)?.validate()?;
+        let mut fire = Fire::new(self.term_sz)?;
+        let mut frame = FrameBuffer::new(self.term_sz, &self.fg, &self.bg)?;
         self.emit(SCREEN_CLEAR)?;
 
-        let init_frame = format!("{CURSOR_HOME}{}{}", self.bg[0], self.fg[0]);
-        let mut frame = FrameBuffer::new(self.term_sz, &self.fg, &self.bg);
-
         while !interrupted() {
-            for x in 0..fire_w {
-                for y in 0..fire_h {
-                    let fire_idx = y * fire_w + x;
-                    let spread_px = screen_buf[fire_idx];
-
-                    if spread_px == 0 && fire_idx >= fire_w {
-                        screen_buf[fire_idx - fire_w] = 0;
-                    } else {
-                        let spread_rnd_idx = self.rng.next_0_to_3();
-                        let spread_dst = if fire_idx >= spread_rnd_idx + 1 {
-                            fire_idx - spread_rnd_idx + 1
-                        } else {
-                            fire_idx
-                        };
-
-                        if spread_dst >= fire_w {
-                            let decay = (spread_rnd_idx & 1) as u8;
-                            screen_buf[spread_dst - fire_w] = if spread_px > decay {
-                                spread_px - decay
-                            } else {
-                                0
-                            };
-                        }
-                    }
-                }
+            if let Some(paused) = self.handle_suspend()? {
+                frame.start += paused;
+            }
+            if interrupted() {
+                break;
+            }
+            let size = platform::term_size(&self.console)?.validate()?;
+            if size != frame.term_sz {
+                fire = Fire::new(size)?;
+                frame = FrameBuffer::new(size, &self.fg, &self.bg)?;
+                self.term_sz = size;
+                self.emit(SCREEN_CLEAR)?;
             }
 
-            frame.reset();
-            frame.draw_str(&init_frame);
-
-            {
-                let fg = &self.fg;
-                let bg = &self.bg;
-                let mut px_prev_hi = fire_black;
-                let mut px_prev_lo = fire_black;
-
-                for y in (0..fire_h).step_by(2) {
-                    for x in 0..fire_w {
-                        let px_hi = screen_buf[y * fire_w + x];
-                        let px_lo = screen_buf[(y + 1) * fire_w + x];
-
-                        if px_lo != px_prev_lo {
-                            frame.draw_str(&bg[FIRE_PALETTE[px_lo as usize]]);
-                        }
-                        if px_hi != px_prev_hi {
-                            frame.draw_str(&fg[FIRE_PALETTE[px_hi as usize]]);
-                        }
-                        frame.draw_str(PX);
-
-                        px_prev_hi = px_hi;
-                        px_prev_lo = px_lo;
-                    }
-                    frame.draw_str(nl());
-                }
-            }
-
+            fire.advance(&mut self.rng);
+            frame.draw_fire(&fire, &self.fg, &self.bg);
             frame.paint(self)?;
-            frame.reset();
         }
 
         Ok(())
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Also restore the terminal on early returns and unwinding.
+        let _ = self.complete();
+    }
+}
+
+struct Fire {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
+impl Fire {
+    fn new(size: TermSize) -> AppResult<Self> {
+        let size = size.validate()?;
+        // Keep the final terminal row available for statistics.
+        let height = (size.height - 1) * 2;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(height * size.width)?;
+        pixels.resize(height * size.width, 0);
+        pixels[(height - 1) * size.width..].fill((FIRE_PALETTE.len() - 1) as u8);
+        Ok(Self {
+            width: size.width,
+            height,
+            pixels,
+        })
+    }
+
+    fn advance(&mut self, rng: &mut Rng) {
+        for x in 0..self.width {
+            for y in 0..self.height {
+                let idx = y * self.width + x;
+                let px = self.pixels[idx];
+                if px == 0 && idx >= self.width {
+                    self.pixels[idx - self.width] = 0;
+                } else {
+                    let spread = rng.next_0_to_3();
+                    let dst = if idx > spread { idx - spread + 1 } else { idx };
+                    if dst >= self.width {
+                        self.pixels[dst - self.width] = px.saturating_sub((spread & 1) as u8);
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct FrameBuffer {
     bytes: Vec<u8>,
+    term_sz: TermSize,
     min_len: u64,
     max_len: u64,
-    avg_len: u64,
+    total_len: u128,
     frame_count: u64,
     start: Instant,
 }
 
 impl FrameBuffer {
-    fn new(term_sz: TermSize, fg: &[String], bg: &[String]) -> Self {
-        let px_char_sz = PX.len();
-        let px_color_sz = bg[LAST_COLOR].len() + fg[LAST_COLOR].len();
-        let px_sz = px_color_sz + px_char_sz;
-        let screen_sz = px_sz * term_sz.width * term_sz.width;
-        let overflow_sz = px_char_sz * 100;
+    fn new(term_sz: TermSize, fg: &[String], bg: &[String]) -> AppResult<Self> {
+        let term_sz = term_sz.validate()?;
+        let px_sz = PX.len() + bg[LAST_COLOR].len() + fg[LAST_COLOR].len();
+        let screen_sz = px_sz * term_sz.width * (term_sz.height - 1);
+        // Cursor positions for every row, initial colors, and the status line.
+        let capacity = screen_sz + term_sz.height * 24 + term_sz.width + 128;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity)?;
 
-        Self {
-            bytes: Vec::with_capacity((screen_sz + overflow_sz) * 2),
+        Ok(Self {
+            bytes,
+            term_sz,
             min_len: 0,
             max_len: 0,
-            avg_len: 0,
+            total_len: 0,
             frame_count: 0,
             start: Instant::now(),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.bytes.clear();
+        })
     }
 
     fn draw_str(&mut self, s: &str) {
         self.bytes.extend_from_slice(s.as_bytes());
     }
 
-    fn paint(&mut self, app: &mut App) -> AppResult<()> {
-        let emit_len = self
-            .bytes
-            .strip_suffix(nl().as_bytes())
-            .map_or(self.bytes.len(), <[u8]>::len);
-        app.emit_bytes(&self.bytes[..emit_len])?;
+    fn draw_fire(&mut self, fire: &Fire, fg: &[String], bg: &[String]) {
+        self.bytes.clear();
+        self.draw_str(CURSOR_HOME);
+        self.draw_str(COLOR_RESET);
+        self.draw_str(&bg[0]);
+        self.draw_str(&fg[0]);
+        let mut prev_hi = 0;
+        let mut prev_lo = 0;
 
-        let frame_len = self.bytes.len() as u64;
-        self.frame_count += 1;
-
-        if self.min_len == 0 {
-            self.min_len = frame_len;
-            self.max_len = frame_len;
-            self.avg_len = frame_len;
-        } else {
-            self.min_len = self.min_len.min(frame_len);
-            self.max_len = self.max_len.max(frame_len);
-            self.avg_len = ((self.avg_len as u128 * (self.frame_count - 1) as u128
-                + frame_len as u128)
-                / self.frame_count as u128) as u64;
+        for y in (0..fire.height).step_by(2) {
+            if y != 0 {
+                write!(&mut self.bytes, "{CSI}{};1H", y / 2 + 1)
+                    .expect("writing into a Vec cannot fail");
+            }
+            for x in 0..fire.width {
+                let hi = fire.pixels[y * fire.width + x];
+                let lo = fire.pixels[(y + 1) * fire.width + x];
+                if lo != prev_lo {
+                    self.draw_str(&bg[FIRE_PALETTE[lo as usize]]);
+                }
+                if hi != prev_hi {
+                    self.draw_str(&fg[FIRE_PALETTE[hi as usize]]);
+                }
+                self.draw_str(PX);
+                prev_hi = hi;
+                prev_lo = lo;
+            }
         }
+    }
 
+    fn record_frame(&mut self, len: u64) {
+        if self.frame_count == 0 {
+            self.min_len = len;
+        }
+        self.min_len = self.min_len.min(len);
+        self.max_len = self.max_len.max(len);
+        self.total_len += u128::from(len);
+        self.frame_count += 1;
+    }
+
+    fn average_len(&self) -> f64 {
+        if self.frame_count == 0 {
+            0.0
+        } else {
+            self.total_len as f64 / self.frame_count as f64
+        }
+    }
+
+    fn draw_status(&mut self) {
         let elapsed = self.start.elapsed().as_secs_f64();
         let fps = if elapsed > 0.0 {
             self.frame_count as f64 / elapsed
         } else {
             0.0
         };
-
-        app.emit_fg(0)?;
-        app.emit_fmt(format_args!(
+        let status = format!(
             "mem: {} min / {} avg / {} max [ {:.2} fps ]",
-            format_binary_bytes(self.min_len),
-            format_binary_bytes(self.avg_len),
-            format_binary_bytes(self.max_len),
+            format_binary_bytes(self.min_len as f64),
+            format_binary_bytes(self.average_len()),
+            format_binary_bytes(self.max_len as f64),
             fps
-        ))?;
-        app.stdout.flush()?;
+        );
+        self.draw_str(&format!("{CSI}{};1H{COLOR_DEF}", self.term_sz.height));
+        // The status is ASCII. Leave the bottom-right cell unused to avoid wrapping.
+        self.draw_str(&status[..status.len().min(self.term_sz.width - 1)]);
+        self.draw_str(LINE_CLEAR_TO_EOL);
+    }
 
+    fn paint(&mut self, app: &mut App) -> AppResult<()> {
+        self.record_frame(self.bytes.len() as u64);
+        self.draw_status();
+        app.emit_bytes(&self.bytes)?;
+        app.stdout.flush()?;
         Ok(())
     }
 }
@@ -629,8 +716,18 @@ fn main() {
 }
 
 fn run() -> AppResult<()> {
+    // Reject invalid streams before job control can suspend a background launch.
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("stdin and stdout must be terminals".into());
+    }
     INTERRUPTED.store(false, Ordering::Relaxed);
-    platform::install_ctrl_c_handler()?;
+    platform::install_exit_handlers()?;
+
+    #[cfg(unix)]
+    platform::wait_for_foreground()?;
+    if interrupted() {
+        return Ok(());
+    }
 
     let mut app = App::new()?;
     let result = app.run();
@@ -645,16 +742,25 @@ fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
 
-fn interruptible_sleep(duration: Duration) {
-    let deadline = Instant::now() + duration;
-
-    while !interrupted() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+// Consume exactly one complete line, without allocating an unbounded input buffer.
+// In particular, keep a CRLF or an answer's remaining bytes out of the next prompt.
+fn read_prompt(input: &mut impl BufRead) -> io::Result<bool> {
+    let mut first = None;
+    loop {
+        let bytes = match input.fill_buf() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if bytes.is_empty() {
+            return Ok(first.is_none() || first == Some(b'q'));
         }
-
-        thread::sleep(remaining.min(Duration::from_millis(25)));
+        first = first.or_else(|| bytes.first().copied());
+        if let Some(end) = bytes.iter().position(|&byte| byte == b'\n') {
+            input.consume(end + 1);
+            return Ok(first == Some(b'q'));
+        }
+        let len = bytes.len();
+        input.consume(len);
     }
 }
 
@@ -680,9 +786,9 @@ fn term_off() -> String {
     format!("{COLOR_RESET}{CURSOR_SHOW}{SCREEN_BUF_OFF}")
 }
 
-fn format_binary_bytes(bytes: u64) -> String {
+fn format_binary_bytes(bytes: f64) -> String {
     let units = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
+    let mut value = bytes;
     let mut unit_idx = 0;
 
     while value >= 1024.0 && unit_idx + 1 < units.len() {
@@ -696,8 +802,10 @@ fn format_binary_bytes(bytes: u64) -> String {
 fn random_seed() -> u64 {
     #[cfg(unix)]
     {
+        use std::io::Read;
+
         let mut bytes = [0_u8; 8];
-        if File::open("/dev/urandom")
+        if std::fs::File::open("/dev/urandom")
             .and_then(|mut file| file.read_exact(&mut bytes))
             .is_ok()
         {
@@ -715,9 +823,10 @@ fn random_seed() -> u64 {
     now ^ (process::id() as u64).rotate_left(17) ^ 0xA5A5_1F1F_D00D_F00D
 }
 
+#[cfg(unix)]
 fn env_term_size() -> Option<TermSize> {
-    let width = env::var("COLUMNS").ok()?.parse().ok()?;
-    let height = env::var("LINES").ok()?.parse().ok()?;
+    let width = std::env::var("COLUMNS").ok()?.parse().ok()?;
+    let height = std::env::var("LINES").ok()?.parse().ok()?;
     Some(TermSize { height, width })
 }
 
@@ -725,7 +834,6 @@ fn env_term_size() -> Option<TermSize> {
 mod platform {
     use super::{INTERRUPTED, Ordering, TermSize, env_term_size};
     use std::{
-        fs::File,
         io,
         os::{
             fd::{AsRawFd, RawFd},
@@ -734,6 +842,8 @@ mod platform {
     };
 
     pub struct Console;
+
+    static SUSPEND_REQUESTED: super::AtomicBool = super::AtomicBool::new(false);
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -744,49 +854,154 @@ mod platform {
         ws_ypixel: c_ushort,
     }
 
+    // These values are ABI-specific, including differences between Linux architectures.
+    #[derive(Debug, PartialEq, Eq)]
+    struct TerminalAbi {
+        winsize: c_ulong,
+        stop: c_int,
+        suspend: c_int,
+        output_on: c_int,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", test))]
+    const fn linux_abi(arch: &str) -> TerminalAbi {
+        let (winsize, stop, suspend) = match arch.as_bytes() {
+            b"mips" | b"mips64" | b"mips32r6" | b"mips64r6" => (0x4008_7468, 23, 24),
+            b"powerpc" | b"powerpc64" => (0x4008_7468, 19, 20),
+            b"sparc" | b"sparc64" => (0x4008_7468, 17, 18),
+            _ => (0x5413, 19, 20),
+        };
+        TerminalAbi {
+            winsize,
+            stop,
+            suspend,
+            output_on: 1,
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    const TIOCGWINSZ: c_ulong = 0x5413;
+    const ABI: TerminalAbi = linux_abi(std::env::consts::ARCH);
 
     #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
+        target_vendor = "apple",
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "netbsd",
         target_os = "dragonfly"
     ))]
-    const TIOCGWINSZ: c_ulong = 0x4008_7468;
+    const ABI: TerminalAbi = TerminalAbi {
+        winsize: 0x4008_7468,
+        stop: 17,
+        suspend: 18,
+        output_on: 2,
+    };
 
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
+        target_vendor = "apple",
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "netbsd",
         target_os = "dragonfly"
     )))]
-    const TIOCGWINSZ: c_ulong = 0x5413;
+    compile_error!("terminal ABI bindings are required for this Unix target");
 
     unsafe extern "C" {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         fn signal(signal: c_int, handler: usize) -> usize;
+        fn raise(signal: c_int) -> c_int;
+        fn tcflow(fd: c_int, action: c_int) -> c_int;
+        fn tcgetpgrp(fd: c_int) -> c_int;
+        fn getpgrp() -> c_int;
+
+        #[cfg_attr(
+            any(target_os = "linux", target_os = "dragonfly"),
+            link_name = "__errno_location"
+        )]
+        #[cfg_attr(
+            any(target_os = "android", target_os = "openbsd", target_os = "netbsd"),
+            link_name = "__errno"
+        )]
+        #[cfg_attr(
+            any(target_vendor = "apple", target_os = "freebsd"),
+            link_name = "__error"
+        )]
+        fn errno_location() -> *mut c_int;
     }
 
     const SIGINT: c_int = 2;
+    const SIGTERM: c_int = 15;
     const SIG_ERR: usize = usize::MAX;
 
-    extern "C" fn handle_sigint(_: c_int) {
-        INTERRUPTED.store(true, Ordering::Relaxed);
+    extern "C" fn handle_signal(sig: c_int) {
+        if sig == ABI.suspend {
+            SUSPEND_REQUESTED.store(true, Ordering::Relaxed);
+        } else {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+        }
+        resume_output();
     }
 
-    pub fn install_ctrl_c_handler() -> io::Result<()> {
-        if unsafe { signal(SIGINT, handle_sigint as *const () as usize) } == SIG_ERR {
+    // Used both by signal handlers and normal cleanup (including q and EOF).
+    pub fn resume_output() {
+        // POSIX makes tcflow/tcgetpgrp/getpgrp async-signal-safe. Wake a write
+        // blocked by Ctrl-S so the main thread can restore the screen. Preserve
+        // errno and avoid changing another foreground job's output state.
+        unsafe {
+            let errno = errno_location();
+            let saved = *errno;
+            if can_access_terminal() {
+                // Linux distinguishes a Ctrl-S pause from a TCOOFF pause:
+                // TCOON alone only restarts the latter. Toggle both actions
+                // to wake either kind of paused output before cleanup.
+                tcflow(1, ABI.output_on - 1);
+                tcflow(1, ABI.output_on);
+            }
+            *errno = saved;
+        }
+    }
+
+    pub fn install_exit_handlers() -> io::Result<()> {
+        SUSPEND_REQUESTED.store(false, Ordering::Relaxed);
+        for sig in [SIGINT, SIGTERM, ABI.suspend] {
+            if unsafe { signal(sig, handle_signal as *const () as usize) } == SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn take_suspend_request() -> bool {
+        SUSPEND_REQUESTED.swap(false, Ordering::Relaxed)
+    }
+
+    fn can_access_terminal() -> bool {
+        let foreground = unsafe { tcgetpgrp(1) };
+        // A terminal descriptor can be usable without being our controlling
+        // terminal (for example after setsid). There is no job-control group
+        // to wait for in that case. Invalid descriptors fail in normal I/O.
+        foreground < 0 || foreground == unsafe { getpgrp() }
+    }
+
+    pub fn wait_for_foreground() -> io::Result<()> {
+        while !super::interrupted() && !can_access_terminal() {
+            // Stop before writing anything, including the initial alternate
+            // screen sequence. `bg` stops again; `fg` permits drawing.
+            if unsafe { raise(ABI.stop) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn suspend_process() -> io::Result<()> {
+        // The caller has flushed terminal restoration. SIGSTOP avoids races
+        // from temporarily replacing the SIGTSTP handler with SIG_DFL.
+        if unsafe { raise(ABI.stop) } != 0 {
             return Err(io::Error::last_os_error());
         }
-
-        Ok(())
+        wait_for_foreground()
     }
 
     pub fn init_console() -> io::Result<Console> {
@@ -797,12 +1012,6 @@ mod platform {
         let stdout = io::stdout();
         if let Ok(Some(size)) = ioctl_term_size(stdout.as_raw_fd()) {
             return Ok(size);
-        }
-
-        if let Ok(tty) = File::open("/dev/tty") {
-            if let Ok(Some(size)) = ioctl_term_size(tty.as_raw_fd()) {
-                return Ok(size);
-            }
         }
 
         Ok(env_term_size().unwrap_or_default())
@@ -816,7 +1025,7 @@ mod platform {
             ws_ypixel: 0,
         };
 
-        let rv = unsafe { ioctl(fd, TIOCGWINSZ, &mut winsz) };
+        let rv = unsafe { ioctl(fd, ABI.winsize, &mut winsz) };
         if rv < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -829,6 +1038,32 @@ mod platform {
             height: winsz.ws_row as usize,
             width: winsz.ws_col as usize,
         }))
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn linux_terminal_abis_match_kernel_headers() {
+            for arch in [
+                "powerpc",
+                "powerpc64",
+                "mips",
+                "mips64",
+                "mips32r6",
+                "mips64r6",
+                "sparc",
+                "sparc64",
+            ] {
+                assert_eq!(linux_abi(arch).winsize, 0x4008_7468);
+            }
+            assert_eq!(linux_abi("mips64").stop, 23);
+            assert_eq!(linux_abi("mips64").suspend, 24);
+            assert_eq!(linux_abi("sparc64").suspend, 18);
+            for arch in ["x86", "x86_64", "aarch64", "arm", "riscv64", "loongarch64"] {
+                assert_eq!(linux_abi(arch).winsize, 0x5413);
+            }
+        }
     }
 }
 
@@ -846,9 +1081,21 @@ mod platform {
 
     pub struct Console {
         handle: Handle,
+        original_mode: Dword,
+        original_code_page: Uint,
+    }
+
+    impl Drop for Console {
+        fn drop(&mut self) {
+            unsafe {
+                SetConsoleOutputCP(self.original_code_page);
+                SetConsoleMode(self.handle, self.original_mode);
+            }
+        }
     }
 
     const STD_OUTPUT_HANDLE: Dword = -11_i32 as Dword;
+    const ENABLE_PROCESSED_OUTPUT: Dword = 0x0001;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
     const DISABLE_NEWLINE_AUTO_RETURN: Dword = 0x0008;
     const CP_UTF8: Uint = 65001;
@@ -885,6 +1132,7 @@ mod platform {
         fn GetStdHandle(nStdHandle: Dword) -> Handle;
         fn GetConsoleMode(hConsoleHandle: Handle, lpMode: *mut Dword) -> Bool;
         fn SetConsoleMode(hConsoleHandle: Handle, dwMode: Dword) -> Bool;
+        fn GetConsoleOutputCP() -> Uint;
         fn SetConsoleOutputCP(wCodePageID: Uint) -> Bool;
         fn GetConsoleScreenBufferInfo(
             hConsoleOutput: Handle,
@@ -912,7 +1160,7 @@ mod platform {
         1
     }
 
-    pub fn install_ctrl_c_handler() -> io::Result<()> {
+    pub fn install_exit_handlers() -> io::Result<()> {
         if unsafe { SetConsoleCtrlHandler(Some(handle_ctrl_c), 1) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -931,7 +1179,19 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
 
-        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+        let original_code_page = unsafe { GetConsoleOutputCP() };
+        if original_code_page == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Create the guard before the first mutation so setup failures also restore state.
+        let console = Console {
+            handle,
+            original_mode: mode,
+            original_code_page,
+        };
+        mode |= ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            | DISABLE_NEWLINE_AUTO_RETURN;
         if unsafe { SetConsoleMode(handle, mode) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -940,7 +1200,7 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Console { handle })
+        Ok(console)
     }
 
     pub fn term_size(console: &Console) -> io::Result<TermSize> {
@@ -1002,6 +1262,60 @@ mod platform {
 mod tests {
     use super::*;
 
+    mod allocations {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+        }
+
+        struct CountingAllocator;
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = COUNT.try_with(|count| count.set(count.get().map(|n| n + 1)));
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+        pub fn count(f: impl FnOnce()) -> usize {
+            COUNT.set(Some(0));
+            f();
+            COUNT.take().unwrap()
+        }
+    }
+
+    #[test]
+    fn prompts_consume_complete_lines_including_crlf() {
+        for input in [b"x\nq\n".as_slice(), b"\r\nq\r\n", b"continue\nq\n"] {
+            // Tiny buffers also exercise lines and CRLF split across reads.
+            let mut reader = io::BufReader::with_capacity(1, input);
+            assert!(!read_prompt(&mut reader).unwrap());
+            assert!(read_prompt(&mut reader).unwrap());
+            assert!(read_prompt(&mut reader).unwrap()); // EOF
+        }
+    }
+
+    #[test]
+    fn drawing_fire_does_not_allocate_after_initialization() {
+        let fg = init_colors("38;5;");
+        let bg = init_colors("48;5;");
+        for (width, height) in [(120, 24), (200, 100)] {
+            let size = TermSize { width, height };
+            let fire = Fire::new(size).unwrap();
+            let mut frame = FrameBuffer::new(size, &fg, &bg).unwrap();
+            assert_eq!(allocations::count(|| frame.draw_fire(&fire, &fg, &bg)), 0);
+        }
+    }
+
     #[test]
     fn rng_range_is_bounded() {
         let mut rng = Rng { state: 1 };
@@ -1017,7 +1331,122 @@ mod tests {
 
     #[test]
     fn formats_binary_bytes() {
-        assert_eq!(format_binary_bytes(0), "0.00 B");
-        assert_eq!(format_binary_bytes(1024), "1.00 KiB");
+        assert_eq!(format_binary_bytes(0.0), "0.00 B");
+        assert_eq!(format_binary_bytes(1024.0), "1.00 KiB");
+    }
+
+    #[test]
+    fn rejects_invalid_and_excessive_dimensions() {
+        for (width, height) in [
+            (0, 24),
+            (120, 0),
+            (120, 1),
+            (usize::MAX, 22),
+            (120, usize::MAX),
+            (1001, 1000),
+        ] {
+            assert!(TermSize { width, height }.validate().is_err());
+            assert!(Fire::new(TermSize { width, height }).is_err());
+        }
+        assert!(
+            TermSize {
+                width: 1000,
+                height: 1000
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn frames_keep_fire_and_status_inside_the_terminal() {
+        let fg = init_colors("38;5;");
+        let bg = init_colors("48;5;");
+        for (width, height) in [(1, 2), (2, 3), (40, 10), (120, 24), (160, 30)] {
+            let size = TermSize { width, height };
+            let mut fire = Fire::new(size).unwrap();
+            assert_eq!(fire.pixels.len(), width * (height - 1) * 2);
+            assert!(
+                fire.pixels[(fire.height - 1) * width..]
+                    .iter()
+                    .all(|&px| px == 25)
+            );
+            let mut rng = Rng { state: 1 };
+            for _ in 0..100 {
+                fire.advance(&mut rng);
+            }
+            assert!(
+                fire.pixels
+                    .iter()
+                    .all(|&px| usize::from(px) < FIRE_PALETTE.len())
+            );
+            let mut frame = FrameBuffer::new(size, &fg, &bg).unwrap();
+            frame.draw_fire(&fire, &fg, &bg);
+            frame.record_frame(frame.bytes.len() as u64);
+            frame.draw_status();
+            let output = std::str::from_utf8(&frame.bytes).unwrap();
+            assert!(!output.contains(['\r', '\n']));
+            // Each row is explicitly positioned; the status has its own final row.
+            for row in 1..height {
+                let start = format!("{CSI}{row};1H");
+                let end = format!("{CSI}{};1H", row + 1);
+                let pixels = output
+                    .split_once(&start)
+                    .unwrap()
+                    .1
+                    .split_once(&end)
+                    .unwrap()
+                    .0;
+                assert_eq!(pixels.matches(PX).count(), width);
+            }
+            let status_start = format!("{CSI}{height};1H{COLOR_DEF}");
+            let status = output.split_once(&status_start).unwrap().1;
+            let text = status.strip_suffix(LINE_CLEAR_TO_EOL).unwrap();
+            assert!(text.is_ascii());
+            assert!(text.len() < width);
+        }
+    }
+
+    #[test]
+    fn wide_frames_allocate_for_area_and_do_not_grow_while_rendering() {
+        let fg = init_colors("38;5;");
+        let bg = init_colors("48;5;");
+        let size = TermSize {
+            width: 2000,
+            height: 22,
+        };
+        let mut fire = Fire::new(size).unwrap();
+        // Alternate colors to exercise the largest encoded frames.
+        for (idx, px) in fire.pixels.iter_mut().enumerate() {
+            *px = (idx % FIRE_PALETTE.len()) as u8;
+        }
+        let mut frame = FrameBuffer::new(size, &fg, &bg).unwrap();
+        let capacity = frame.bytes.capacity();
+        assert!(capacity < 2 * 1024 * 1024);
+        frame.draw_fire(&fire, &fg, &bg);
+        frame.record_frame(frame.bytes.len() as u64);
+        frame.draw_status();
+        assert_eq!(frame.bytes.capacity(), capacity);
+    }
+
+    #[test]
+    fn averages_use_the_total_without_accumulated_rounding() {
+        let mut frame = FrameBuffer::new(
+            TermSize {
+                width: 120,
+                height: 24,
+            },
+            &init_colors("38;5;"),
+            &init_colors("48;5;"),
+        )
+        .unwrap();
+        assert_eq!(frame.average_len(), 0.0);
+        frame.record_frame(100);
+        for _ in 1..1000 {
+            frame.record_frame(200);
+        }
+        assert_eq!(frame.min_len, 100);
+        assert_eq!(frame.max_len, 200);
+        assert_eq!(format_binary_bytes(frame.average_len()), "199.90 B");
     }
 }
