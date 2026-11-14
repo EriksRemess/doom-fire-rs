@@ -2,11 +2,12 @@
 name = "doom-fire-rs"
 version = "0.1.2"
 edition = "2024"
+rust-version = "1.100"
 license = "GPL-3.0-or-later"
-description = "Dependency-free Rust port of DOOM-fire-zig"
+description = "Rust port of the DOOM-fire-zig terminal stress test"
 repository = "https://github.com/EriksRemess/doom-fire-rs"
 
 [dependencies]
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

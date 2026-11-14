@@ -4,7 +4,7 @@
 use std::{
     fs::File,
     io::{self, Read, Write},
-    mem::MaybeUninit,
+    mem::{DropGuard, MaybeUninit},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::process::CommandExt,
@@ -21,7 +21,7 @@ const HOME: &[u8] = b"\x1b[1;1H";
 const OFF: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
 const ON: &[u8] = b"\x1b[?1049h";
 const PX: &[u8] = "▀".as_bytes();
-const FRAME_END: &[u8] = b" fps ]\x1b[0K";
+const FRAME_END: &[u8] = b"\x1b[0K";
 
 // openpty has no portable atomic CLOEXEC option. Exclude every child spawn
 // until both new descriptors have been marked close-on-exec.
@@ -140,13 +140,34 @@ impl Terminal {
     fn spawn_with_session(
         rows: u16,
         columns: u16,
-        mut command: Command,
+        command: Command,
         memory_limit: Option<libc::rlim_t>,
         controlling_terminal: bool,
     ) -> Self {
+        Self::spawn_with_input(rows, columns, command, memory_limit, controlling_terminal).0
+    }
+
+    fn spawn_with_input(
+        rows: u16,
+        columns: u16,
+        mut command: Command,
+        memory_limit: Option<libc::rlim_t>,
+        controlling_terminal: bool,
+    ) -> (Self, File) {
         let (master, slave) = pty(rows, columns);
+        // Give stdin its own file description so input flags cannot affect output.
+        let mut name = [0; 1024];
+        let result = unsafe { libc::ttyname_r(slave.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+        assert_eq!(result, 0);
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
+            .unwrap();
         command
-            .stdin(slave.try_clone().unwrap())
+            .stdin(input.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave);
         // Only async-signal-safe libc calls run between fork and exec.
@@ -172,11 +193,14 @@ impl Terminal {
             });
         }
         let process = spawn_command(&mut command).unwrap();
-        Self {
-            master,
-            process,
-            buffer: Vec::new(),
-        }
+        (
+            Self {
+                master,
+                process,
+                buffer: Vec::new(),
+            },
+            input,
+        )
     }
 
     fn resize(&self, rows: u16, columns: u16) {
@@ -649,6 +673,15 @@ fn pty_descriptors_are_not_inherited() {
             drop(pty(24, 80));
         }
     });
+    let creator = DropGuard::new(creator, move |creator| {
+        stop.store(true, Ordering::Relaxed);
+        let result = creator.join();
+        // Report worker failures on normal exit without panicking twice if
+        // the test itself is already unwinding.
+        if !thread::panicking() {
+            result.unwrap();
+        }
+    });
     let result = (|| -> io::Result<()> {
         for _ in 0..200 {
             let mut command = Command::new(std::env::current_exe()?);
@@ -672,8 +705,7 @@ fn pty_descriptors_are_not_inherited() {
         }
         Ok(())
     })();
-    stop.store(true, Ordering::Relaxed);
-    creator.join().unwrap();
+    drop(creator);
     result.unwrap();
 }
 
@@ -722,4 +754,212 @@ fn background_start_rejects_redirected_streams_without_stopping() {
     }
     terminal.send(b"exit\n");
     assert!(terminal.finish().0.success());
+}
+
+const KITTY_DELETE: &[u8] = b"\x1b_Ga=d,d=I,i=1146048333,q=2\x1b\\";
+
+fn kitty_terminal() -> Terminal {
+    let mut command = Command::new(BINARY);
+    command.arg("--kitty");
+    let mut terminal = Terminal::spawn(24, 120, command, None);
+    let preview = terminal.expect(PROMPT);
+    assert!(contains(&preview, b"Output: Kitty RGB | res: 480x184"));
+    assert!(contains(&preview, b"RGB: \x1b[48;2;"));
+    assert!(contains(&preview, b"Text: \x1b[1mbold"));
+    assert!(!contains(&preview, b"\x1b_Ga=T,"));
+    terminal.send(b"\n");
+    terminal
+}
+
+fn assert_kitty_frame(output: &[u8], columns: u16, rows: u16) {
+    assert!(!contains(output, PROMPT));
+    assert!(!contains(output, PX));
+    let dimensions = format!("s={},v={},i=1146048333,", columns * 4, (rows - 1) * 8);
+    assert!(contains(output, dimensions.as_bytes()));
+    let resolution = format!("res: {}x{} |", columns * 4, (rows - 1) * 8);
+    assert!(contains(output, resolution.as_bytes()));
+    assert!(contains(output, b"\x1b_Ga=T,") || contains(output, b"\x1b_Ga=f,"));
+    assert!(contains(output, format!("\x1b[{rows};1H").as_bytes()));
+    assert!(contains(output, FRAME_END));
+    for metric in [
+        b" fps |".as_slice(),
+        b" MPix/s |",
+        b" MiB/s |",
+        b" ms/f |",
+        b"sim/enc/write:",
+    ] {
+        assert!(contains(output, metric));
+    }
+}
+
+#[test]
+fn q_exits_animation_without_return_and_restores_input() {
+    for kitty in [false, true] {
+        for paused in [false, true] {
+            let mut command = Command::new(BINARY);
+            if kitty {
+                command.arg("--kitty");
+            }
+            let mut terminal = Terminal::spawn(24, 120, command, None);
+            terminal.expect(PROMPT);
+            let original = terminal.modes();
+            terminal.send(b"\n");
+            terminal.expect(FRAME_END);
+            let active = terminal.modes();
+            assert_eq!(active.c_lflag & (libc::ICANON | libc::ECHO), 0);
+            assert_ne!(active.c_lflag & libc::ISIG, 0);
+            if paused {
+                terminal.send(b"\x13");
+                thread::sleep(Duration::from_millis(100));
+            }
+            terminal.send(b"q");
+            let output = terminal.assert_restored(0);
+            assert_eq!(contains(&output, KITTY_DELETE), kitty);
+            let restored = terminal.modes();
+            assert_eq!(restored.c_lflag, original.c_lflag);
+            assert_eq!(restored.c_iflag, original.c_iflag);
+            assert_eq!(restored.c_oflag, original.c_oflag);
+            assert_eq!(restored.c_cflag, original.c_cflag);
+            assert_eq!(restored.c_cc, original.c_cc);
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn keyboard_read_failure_reports_error_after_terminal_cleanup() {
+    for kitty in [false, true] {
+        let mut command = Command::new(BINARY);
+        if kitty {
+            command.arg("--kitty");
+        }
+        let (mut terminal, input) = Terminal::spawn_with_input(24, 120, command, None, true);
+        terminal.expect(PROMPT);
+        let original = terminal.modes();
+        terminal.send(b"\n");
+        terminal.expect(FRAME_END);
+        terminal.send(b"\x13");
+        thread::sleep(Duration::from_millis(100));
+        // The shared stdin file description now fails idle reads with EAGAIN.
+        unsafe {
+            let flags = libc::fcntl(input.as_raw_fd(), libc::F_GETFL);
+            assert_ne!(flags, -1);
+            checked(libc::fcntl(
+                input.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            ))
+            .unwrap();
+        }
+        drop(input);
+        let output = terminal.assert_restored(1);
+        let error = position(&output, b"doom-fire-rs: keyboard input:").unwrap();
+        assert!(position(&output, OFF).unwrap() < error);
+        assert_eq!(contains(&output, KITTY_DELETE), kitty);
+        let restored = terminal.modes();
+        assert_eq!(restored.c_lflag, original.c_lflag);
+        assert_eq!(restored.c_iflag, original.c_iflag);
+        assert_eq!(restored.c_oflag, original.c_oflag);
+        assert_eq!(restored.c_cflag, original.c_cflag);
+        assert_eq!(restored.c_cc, original.c_cc);
+    }
+}
+
+#[test]
+fn kitty_frames_resize_and_cleanup() {
+    let mut terminal = kitty_terminal();
+    for _ in 0..3 {
+        assert_kitty_frame(&terminal.expect(FRAME_END), 120, 24);
+    }
+    terminal.resize(30, 160);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = terminal.expect_until(FRAME_END, deadline);
+        if contains(&frame, b"s=640,v=232,") {
+            assert_kitty_frame(&frame, 160, 30);
+            break;
+        }
+    }
+    terminal.signal(libc::SIGTERM);
+    let output = terminal.assert_restored(0);
+    assert_eq!(count(&output, KITTY_DELETE), 1);
+    assert!(position(&output, KITTY_DELETE).unwrap() < position(&output, OFF).unwrap());
+}
+
+#[test]
+fn kitty_suspend_resumes_after_resize_and_paused_output() {
+    let mut terminal = kitty_terminal();
+    terminal.expect(FRAME_END);
+    terminal.send(b"\x13");
+    thread::sleep(Duration::from_millis(100));
+    terminal.signal(libc::SIGTSTP);
+    let stopped = terminal.expect(OFF);
+    assert!(contains(&stopped, KITTY_DELETE));
+    assert_ne!(terminal.modes().c_lflag & libc::ICANON, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut status = 0;
+        // Observe the stop without reaping the still-live child.
+        let result = unsafe {
+            libc::waitpid(
+                terminal.process.id() as _,
+                &mut status,
+                libc::WUNTRACED | libc::WNOHANG,
+            )
+        };
+        assert_ne!(result, -1);
+        if result > 0 {
+            assert!(libc::WIFSTOPPED(status));
+            break;
+        }
+        assert!(Instant::now() < deadline, "child did not suspend");
+        thread::sleep(Duration::from_millis(10));
+    }
+    terminal.resize(30, 160);
+    terminal.signal(libc::SIGCONT);
+    terminal.expect(ON);
+    assert_kitty_frame(&terminal.expect(FRAME_END), 160, 30);
+    terminal.send(b"\x13");
+    thread::sleep(Duration::from_millis(100));
+    terminal.send(b"q");
+    assert!(contains(&terminal.assert_restored(0), KITTY_DELETE));
+}
+
+#[test]
+fn kitty_invalid_resize_deletes_image_before_error() {
+    let mut terminal = kitty_terminal();
+    terminal.expect(FRAME_END);
+    terminal.resize(1, 120);
+    let output = terminal.assert_restored(1);
+    assert!(position(&output, KITTY_DELETE).unwrap() < position(&output, OFF).unwrap());
+    assert!(contains(&output, b"at least 1 column by 2 rows"));
+}
+
+#[test]
+fn command_line_help_and_errors_work_without_a_terminal() {
+    for (args, code, expected) in [
+        (vec!["--help"], 0, "--kitty"),
+        (vec!["--version"], 0, env!("CARGO_PKG_VERSION")),
+        (vec!["--unknown"], 1, "unknown argument"),
+        (vec!["--kitty"], 1, "stdin and stdout must be terminals"),
+    ] {
+        let output = spawn_command(
+            Command::new(BINARY)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        let text = if code == 0 {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        assert!(contains(&text, expected.as_bytes()));
+        assert!(!text.contains(&0x1b));
+    }
 }
